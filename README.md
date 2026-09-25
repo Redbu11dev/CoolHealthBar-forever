@@ -2,7 +2,7 @@
 
 Extra health and power bar
 
-(!) Rename folder to "CoolHealthBar-forever" (!)
+(!) Rename folder to "CoolHealthBar" (!)
 
 /coolhealthbar or /chb to open settings menu
 
