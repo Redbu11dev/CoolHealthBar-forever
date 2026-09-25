@@ -1,5 +1,7 @@
 # CoolHealthBar-forever
 
+Ported to WoW Forever from https://github.com/Redbu11dev/CoolHealthBar
+
 Extra health and power bar
 
 (!) Rename folder to "CoolHealthBar" (!)
@@ -13,5 +15,6 @@ Features:
 - Minimap button for settings
 - Per-character settings
 
-![image](https://github.com/user-attachments/assets/f92d092a-ebfe-4042-80d6-c7678bc8b8a6)
+<img width="1028" height="774" alt="image" src="https://github.com/user-attachments/assets/bfefe0ba-ae1c-4577-9d5c-ec70551807b8" />
+
 
