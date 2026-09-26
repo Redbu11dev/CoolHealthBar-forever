@@ -1,34 +1,27 @@
---local frame = CreateFrame("Frame")
-
 local _G = _G
 
 SLASH_COOLHEALTHBAR1 = '/coolhealthbar'
 SLASH_COOLHEALTHBAR2 = '/chb'
 SlashCmdList["COOLHEALTHBAR"] = function(msg)
-  -- if ShaguPlates.gui:IsShown() then
-    -- ShaguPlates.gui:Hide()
-  -- else
-    -- ShaguPlates.gui:Show()
-  -- end
   coolHealthBarOptionsFrame:Show()
 end
 
 ------------------
-
--- -- Helper function to strip modern WoW's "secret number" taint flag
--- local function GetSafeNumber(val)
-    -- if val == nil then return 0 end
-    -- return tonumber(tostring(val)) or 0
--- end
-
 -- Helper function to check for Patch 12.0.5+ secret values
 local issecretvalue = _G.issecretvalue or function() return false end
 
+-- Midnight / 12.0+ Secret Health Percent Curve
+local ScaleTo100Curve = (CurveConstants and CurveConstants.ScaleTo100)
+if not ScaleTo100Curve and C_CurveUtil and C_CurveUtil.CreateCurve and Enum and Enum.LuaCurveType then
+    ScaleTo100Curve = C_CurveUtil.CreateCurve()
+    ScaleTo100Curve:SetType(Enum.LuaCurveType.Linear)
+    ScaleTo100Curve:AddPoint(0, 0)
+    ScaleTo100Curve:AddPoint(1, 100)
+end
 ------------------
 
 local addonIsLoaded = false
 local playerEnteredWorld = false
-
 local playerIsInCombatLockdown = false
 
 local currentHp = 0
@@ -38,92 +31,32 @@ local maxPower = 0
 
 local anyWatchedBuffFound = false
 
+-- Texture & Spell Name Cache
+local CachedTextureToName = {}
+local CachedSpellNameToTexture = {}
+local CachedSpellDuration = {}
+
+-- Active tracked buff states (survives combat lockdowns)
+local ActiveWatchedL1 = nil
+local ActiveWatchedR1 = nil
+
+-- Pre-seed common consumable textures
+local CommonConsumables = {
+    [133939] = "Food",
+    [134062] = "Food",
+    [132800] = "Drink",
+    [132794] = "Drink",
+    [132805] = "Drink",
+    [132792] = "Drink",
+}
+for tex, name in pairs(CommonConsumables) do
+    CachedTextureToName[tex] = name
+    CachedSpellNameToTexture[string.upper(name)] = tex
+end
+
 local mainFrame = CreateFrame("Frame", "CoolHealthBarMainFrame", UIParent, "BackdropTemplate")
 mainFrame:SetFrameStrata("LOW")
 mainFrame.TimeToCheck = 0
-
-local coolHealthBarScanTooltip = nil
-
--- Modern API equivalent for getBuffInfo
-local function getBuffInfo(index, filter)
-    if C_UnitAuras and C_UnitAuras.GetAuraDataByIndex then
-        -- Wrap the API call in pcall to catch "secret" access errors silently
-        local success, auraData = pcall(C_UnitAuras.GetAuraDataByIndex, "player", index, filter)
-        
-        if success and auraData then
-            local name = auraData.name
-            local icon = auraData.icon
-            local expirationTime = auraData.expirationTime
-            local applications = auraData.applications
-            
-            -- Sanitize the returns just in case they are partially restricted
-            if issecretvalue(name) then name = "Unknown" end
-            if issecretvalue(icon) then icon = "Interface\\Icons\\INV_Misc_QuestionMark" end
-            
-            local timeLeft = 0
-            if expirationTime and not issecretvalue(expirationTime) and expirationTime > 0 then
-                timeLeft = expirationTime - GetTime()
-                if timeLeft < 0 then timeLeft = 0 end
-            end
-            
-            local count = applications or 0
-            if issecretvalue(count) then count = 0 end
-            
-            return name, icon, timeLeft, count
-        end
-    elseif UnitAura then
-        -- Fallback for environments where C_UnitAuras is unavailable
-        local success, name, icon, count, _, _, expirationTime = pcall(UnitAura, "player", index, filter)
-        
-        if success and name then
-            if issecretvalue(name) then name = "Unknown" end
-            if issecretvalue(icon) then icon = "Interface\\Icons\\INV_Misc_QuestionMark" end
-            
-            local timeLeft = 0
-            if expirationTime and not issecretvalue(expirationTime) and expirationTime > 0 then
-                timeLeft = expirationTime - GetTime()
-                if timeLeft < 0 then timeLeft = 0 end
-            end
-            
-            if issecretvalue(count) then count = 0 end
-            
-            return name, icon, timeLeft, count
-        end
-    end
-    return nil
-end
-
-mainFrame:SetScript("OnEvent", function(self, event, ...)
-	local arg1 = ...
-
-	if event == "ADDON_LOADED" and arg1 == "CoolHealthBar" then
-		mainFrame:UnregisterEvent("ADDON_LOADED")
-		
-	elseif event == "PLAYER_ENTERING_WORLD" then
-		-- Initial setup: Only build the UI once
-		if not addonIsLoaded then
-			addonIsLoaded = true
-			CoolHealthBar_OnLoad()
-		end
-		
-		-- Force a UI refresh because the player is now fully loaded in the world
-		UpdateHealth()
-		UpdatePower()
-		
-	elseif (event == "UNIT_HEALTH" or event == "UNIT_MAXHEALTH") and arg1 == "player" then
-		UpdateHealth()
-	elseif (event == "UNIT_POWER_UPDATE" or event == "UNIT_MAXPOWER") and arg1 == "player" then
-		UpdatePower()
-	elseif event == "PLAYER_REGEN_DISABLED" then
-		playerIsInCombatLockdown = true
-		ChangeHealthBarVisibility()
-	elseif event == "PLAYER_REGEN_ENABLED" then
-		playerIsInCombatLockdown = false
-		ChangeHealthBarVisibility()
-	elseif event == "UNIT_AURA" and arg1 == "player" then
-		-- Optional future aura scanning
-	end
-end)
 
 local function trimString(s)
   local l = 1
@@ -137,145 +70,344 @@ local function trimString(s)
   return strsub(s,l,r)
 end
 
+-- Index Spellbook spells so we can identify auras by name & texture
+local function UpdateSpellbookCache()
+    if C_SpellBook and C_SpellBook.GetNumSpellBookSkillLines then
+        local numLines = C_SpellBook.GetNumSpellBookSkillLines()
+        for i = 1, numLines do
+            local skillLineInfo = C_SpellBook.GetSpellBookSkillLineInfo(i)
+            if skillLineInfo then
+                local offset = skillLineInfo.itemIndexOffset
+                local numEntries = skillLineInfo.numSpellBookItems
+                for s = offset + 1, offset + numEntries do
+                    local itemInfo = C_SpellBook.GetSpellBookItemInfo(s, Enum.SpellBookSpellBank.Player)
+                    if itemInfo and itemInfo.name and itemInfo.iconID then
+                        CachedTextureToName[itemInfo.iconID] = itemInfo.name
+                        CachedSpellNameToTexture[string.upper(itemInfo.name)] = itemInfo.iconID
+                    end
+                end
+            end
+        end
+    elseif GetNumSpellTabs then
+        local numTabs = GetNumSpellTabs()
+        for t = 1, numTabs do
+            local _, _, offset, numEntries = GetSpellTabInfo(t)
+            for s = offset + 1, offset + numEntries do
+                local spellName = GetSpellBookItemName(s, "spell")
+                local spellTexture = GetSpellBookItemTexture(s, "spell")
+                if spellName and spellTexture then
+                    CachedTextureToName[spellTexture] = spellName
+                    CachedSpellNameToTexture[string.upper(spellName)] = spellTexture
+                end
+            end
+        end
+    end
+end
+
+-- Secret-Safe Pattern Matcher
+local function MatchesWatchPattern(buffName, buffTexture, watchList, useExact)
+    if not watchList or #watchList == 0 then return false end
+
+    -- 1. Direct name match (when non-secret)
+    if buffName and buffName ~= "Unknown" and not issecretvalue(buffName) then
+        local upperName = string.upper(buffName)
+        for _, pattern in ipairs(watchList) do
+            local upperPattern = string.upper(pattern)
+            if useExact then
+                if upperName == upperPattern then return true end
+            else
+                if string.find(upperName, upperPattern, 1, true) then return true end
+            end
+        end
+    end
+
+    -- 2. Resolve via non-secret texture lookup
+    if buffTexture and not issecretvalue(buffTexture) then
+        if CachedTextureToName[buffTexture] then
+            local cachedName = string.upper(CachedTextureToName[buffTexture])
+            for _, pattern in ipairs(watchList) do
+                local upperPattern = string.upper(pattern)
+                if useExact then
+                    if cachedName == upperPattern then return true end
+                else
+                    if string.find(cachedName, upperPattern, 1, true) then return true end
+                end
+            end
+        end
+
+        for _, pattern in ipairs(watchList) do
+            local upperPattern = string.upper(pattern)
+            for spellName, texture in pairs(CachedSpellNameToTexture) do
+                if (useExact and spellName == upperPattern) or (not useExact and string.find(spellName, upperPattern, 1, true)) then
+                    if texture == buffTexture then
+                        return true
+                    end
+                end
+            end
+        end
+    end
+
+    return false
+end
+
 local buffWatchL1Names = {}
 local buffWatchR1Names = {}
 
+-- Update individual buff slot display
+local function UpdateBuffSlot(slot, aura)
+    if not aura or not aura.icon then
+        slot:Hide()
+        return
+    end
+
+    slot.icon:SetTexture(aura.icon)
+    
+    if slot.cooldown then
+        if aura.startTime and aura.duration and aura.duration > 0 then
+            slot.cooldown:SetCooldown(aura.startTime, aura.duration)
+            slot.cooldown:Show()
+        else
+            slot.cooldown:Hide()
+        end
+    end
+    
+    if aura.durationText and aura.durationText ~= "" then
+        slot.textDuration:SetFormattedText("%s", aura.durationText)
+    else
+        slot.textDuration:SetText("")
+    end
+
+    if aura.countText and aura.countText ~= "" then
+        slot.textCount:SetFormattedText("%s", aura.countText)
+    else
+        slot.textCount:SetText("")
+    end
+    
+    slot:Show()
+end
+
+-- Process live spellcasts (catches Seal swaps and Holy Shield in combat)
+local function OnSpellCastSucceeded(spellIdentifier)
+    if not spellIdentifier then return end
+    
+    local spellName, spellTexture
+    if type(spellIdentifier) == "number" then
+        local sInfo = C_Spell and C_Spell.GetSpellInfo and C_Spell.GetSpellInfo(spellIdentifier)
+        spellName = sInfo and sInfo.name or (GetSpellInfo and GetSpellInfo(spellIdentifier))
+        spellTexture = sInfo and sInfo.iconID or (GetSpellTexture and GetSpellTexture(spellIdentifier))
+    else
+        spellName = tostring(spellIdentifier)
+        spellTexture = GetSpellTexture and GetSpellTexture(spellName)
+    end
+    
+    if not spellName then return end
+    local upperSpellName = string.upper(spellName)
+    
+    -- -- Judgement releases/consumes your active Seal
+    -- if string.find(upperSpellName, "JUDGEMENT") or string.find(upperSpellName, "JUDGMENT") then
+        -- if ActiveWatchedL1 and ActiveWatchedL1.isSeal then
+            -- ActiveWatchedL1 = nil
+            -- mainFrame.buffWatchL1:Hide()
+        -- end
+        -- return
+    -- end
+    
+    -- Check if the cast spell matches Left 1 (e.g. Seal of Command / Righteousness)
+    if MatchesWatchPattern(spellName, spellTexture, buffWatchL1Names, CoolHealthBarSettings.useExactNamingL1) then
+        local isSeal = (string.find(upperSpellName, "SEAL OF") ~= nil)
+        local dur = CachedSpellDuration[upperSpellName] or (isSeal and 30) or 30
+        ActiveWatchedL1 = {
+            name = spellName,
+            icon = spellTexture,
+            spellId = spellIdentifier,
+            startTime = GetTime(),
+            duration = dur,
+            isSeal = isSeal,
+        }
+        UpdateBuffSlot(mainFrame.buffWatchL1, ActiveWatchedL1)
+        anyWatchedBuffFound = true
+    end
+    
+    -- Check if the cast spell matches Right 1 (e.g. Holy Shield)
+    if MatchesWatchPattern(spellName, spellTexture, buffWatchR1Names, CoolHealthBarSettings.useExactNamingR1) then
+        local dur = CachedSpellDuration[upperSpellName] or (string.find(upperSpellName, "HOLY SHIELD") and 10) or 10
+        ActiveWatchedR1 = {
+            name = spellName,
+            icon = spellTexture,
+            spellId = spellIdentifier,
+            startTime = GetTime(),
+            duration = dur,
+        }
+        UpdateBuffSlot(mainFrame.buffWatchR1, ActiveWatchedR1)
+        anyWatchedBuffFound = true
+    end
+end
+
+-- Periodic Scanner
 mainFrame:SetScript("OnUpdate", function(self, elapsed)
     mainFrame.TimeToCheck = mainFrame.TimeToCheck - elapsed
-    if mainFrame.TimeToCheck > 0 then 
-        return -- We haven't counted down to zero yet so do nothing
-    end
-    mainFrame.TimeToCheck = 0.01 -- Wait a fraction of a second so reset the timer
+    if mainFrame.TimeToCheck > 0 then return end
+    mainFrame.TimeToCheck = 0.05
 	
 	anyWatchedBuffFound = false
 	local buffL1Found = false
 	local buffR1Found = false
+    local inCombat = InCombatLockdown() or UnitAffectingCombat("player")
 	
-	-- Modern WoW requires us to scan Buffs (HELPFUL) and Debuffs (HARMFUL) separately
-    for _, filter in ipairs({"HELPFUL", "HARMFUL"}) do
-		for i=1, 40 do
-			local buffName, bufftexture, buffSecondsLeft, buffCount = getBuffInfo(i, filter)
-			
-			if not buffName then break end -- No more auras of this type, break the inner loop early
-				
-			-- Check L1
-			if not buffL1Found and (#buffWatchL1Names > 0) then
-				for _, buffToWatchName in ipairs(buffWatchL1Names) do
-					local doesNameMatch = false
-					
-					if not CoolHealthBarSettings.useExactNamingL1 then
-						-- Added the 'true' flag for plain text search to avoid pattern matching errors
-						if (string.find(string.upper(buffName), string.upper(buffToWatchName), 1, true)) then
-							doesNameMatch = true
-						end
-					else
-						if (string.upper(buffName) == string.upper(buffToWatchName)) then
-							doesNameMatch = true
-						end
-					end
-				
-					if doesNameMatch then
-						mainFrame.buffWatchL1.icon:SetTexture(bufftexture)
-						if (buffSecondsLeft > 0) then
-							mainFrame.buffWatchL1.textDuration:SetText(""..math.floor(buffSecondsLeft))
-						else
-							mainFrame.buffWatchL1.textDuration:SetText("")
-						end
-						
-						if (buffCount and buffCount > 1) then
-							mainFrame.buffWatchL1.textCount:SetText(""..buffCount)
-						else
-							mainFrame.buffWatchL1.textCount:SetText("")
-						end
-						
-						mainFrame.buffWatchL1:Show()
-						buffL1Found = true
-						anyWatchedBuffFound = true
-						break
-					end
-				end
-			end
-			
-			-- Check R1
-			if not buffR1Found and (#buffWatchR1Names > 0) then
-				for _, buffToWatchName in ipairs(buffWatchR1Names) do
-					local doesNameMatch = false
-					
-					if not CoolHealthBarSettings.useExactNamingR1 then
-						-- Added the 'true' flag for plain text search to avoid pattern matching errors
-						if (string.find(string.upper(buffName), string.upper(buffToWatchName), 1, true)) then
-							doesNameMatch = true
-						end
-					else
-						if (string.upper(buffName) == string.upper(buffToWatchName)) then
-							doesNameMatch = true
-						end
-					end
-					
-					if doesNameMatch then
-						mainFrame.buffWatchR1.icon:SetTexture(bufftexture)
-						if (buffSecondsLeft > 0) then
-							mainFrame.buffWatchR1.textDuration:SetText(""..math.floor(buffSecondsLeft))
-						else
-							mainFrame.buffWatchR1.textDuration:SetText("")
-						end
-						
-						if (buffCount and buffCount > 1) then
-							mainFrame.buffWatchR1.textCount:SetText(""..buffCount)
-						else
-							mainFrame.buffWatchR1.textCount:SetText("")
-						end
-						
-						mainFrame.buffWatchR1:Show()
-						buffR1Found = true
-						anyWatchedBuffFound = true
-						break
-					end
-				end
-			end
-			
-			-- If both slots are filled, no need to keep scanning!
-			if buffL1Found and buffR1Found then
-				break
-			end
-		end
+    -- === 1. Out of Combat: Scan C_UnitAuras and seed active states ===
+    if not inCombat and C_UnitAuras and C_UnitAuras.GetAuraDataByIndex then
+        for _, filter in ipairs({"HELPFUL", "HARMFUL"}) do
+            for i = 1, 40 do
+                local success, data = pcall(C_UnitAuras.GetAuraDataByIndex, "player", i, filter)
+                if success and data and data.icon and data.name and not issecretvalue(data.name) then
+                    CachedTextureToName[data.icon] = data.name
+                    CachedSpellNameToTexture[string.upper(data.name)] = data.icon
+                    
+                    local dur = data.duration or 0
+                    if dur > 0 and not issecretvalue(dur) then
+                        CachedSpellDuration[string.upper(data.name)] = dur
+                    end
+
+                    local timeLeft = 0
+                    if data.expirationTime and not issecretvalue(data.expirationTime) and data.expirationTime > 0 then
+                        timeLeft = data.expirationTime - GetTime()
+                        if timeLeft < 0 then timeLeft = 0 end
+                    end
+
+                    -- Check L1 match
+                    if not buffL1Found and MatchesWatchPattern(data.name, data.icon, buffWatchL1Names, CoolHealthBarSettings.useExactNamingL1) then
+                        local isSeal = (string.find(string.upper(data.name), "SEAL OF") ~= nil)
+                        ActiveWatchedL1 = {
+                            name = data.name,
+                            icon = data.icon,
+                            spellId = data.spellId,
+                            startTime = GetTime() - (dur - timeLeft),
+                            duration = dur > 0 and dur or 30,
+                            durationText = (timeLeft > 0) and tostring(math.floor(timeLeft)) or "",
+                            countText = (data.applications and data.applications > 1) and tostring(data.applications) or "",
+                            isSeal = isSeal,
+                        }
+                        buffL1Found = true
+                    end
+
+                    -- Check R1 match
+                    if not buffR1Found and MatchesWatchPattern(data.name, data.icon, buffWatchR1Names, CoolHealthBarSettings.useExactNamingR1) then
+                        ActiveWatchedR1 = {
+                            name = data.name,
+                            icon = data.icon,
+                            spellId = data.spellId,
+                            startTime = GetTime() - (dur - timeLeft),
+                            duration = dur > 0 and dur or 10,
+                            durationText = (timeLeft > 0) and tostring(math.floor(timeLeft)) or "",
+                            countText = (data.applications and data.applications > 1) and tostring(data.applications) or "",
+                        }
+                        buffR1Found = true
+                    end
+                else
+                    break
+                end
+            end
+        end
+    end
+
+    -- === 2. Manage L1 State & Timers ===
+    if ActiveWatchedL1 then
+        if ActiveWatchedL1.duration and ActiveWatchedL1.duration > 0 and ActiveWatchedL1.startTime then
+            local rem = ActiveWatchedL1.duration - (GetTime() - ActiveWatchedL1.startTime)
+            if rem <= 0 then
+                ActiveWatchedL1 = nil
+                mainFrame.buffWatchL1:Hide()
+            else
+                ActiveWatchedL1.durationText = tostring(math.floor(rem))
+                UpdateBuffSlot(mainFrame.buffWatchL1, ActiveWatchedL1)
+                buffL1Found = true
+                anyWatchedBuffFound = true
+            end
+        else
+            UpdateBuffSlot(mainFrame.buffWatchL1, ActiveWatchedL1)
+            buffL1Found = true
+            anyWatchedBuffFound = true
+        end
+    else
+        mainFrame.buffWatchL1:Hide()
+    end
+
+    -- === 3. Manage R1 State & Timers ===
+    if ActiveWatchedR1 then
+        if ActiveWatchedR1.duration and ActiveWatchedR1.duration > 0 and ActiveWatchedR1.startTime then
+            local rem = ActiveWatchedR1.duration - (GetTime() - ActiveWatchedR1.startTime)
+            if rem <= 0 then
+                ActiveWatchedR1 = nil
+                mainFrame.buffWatchR1:Hide()
+            else
+                ActiveWatchedR1.durationText = tostring(math.floor(rem))
+                UpdateBuffSlot(mainFrame.buffWatchR1, ActiveWatchedR1)
+                buffR1Found = true
+                anyWatchedBuffFound = true
+            end
+        else
+            UpdateBuffSlot(mainFrame.buffWatchR1, ActiveWatchedR1)
+            buffR1Found = true
+            anyWatchedBuffFound = true
+        end
+    else
+        mainFrame.buffWatchR1:Hide()
+    end
+end)
+
+mainFrame:SetScript("OnEvent", function(self, event, ...)
+	local arg1 = ...
+
+	if event == "ADDON_LOADED" and arg1 == "CoolHealthBar" then
+		mainFrame:UnregisterEvent("ADDON_LOADED")
 		
-		-- If both slots are filled, no need to check the second filter
-		if buffL1Found and buffR1Found then
-			break
+	elseif event == "PLAYER_ENTERING_WORLD" then
+		if not addonIsLoaded then
+			addonIsLoaded = true
+			CoolHealthBar_OnLoad()
 		end
-	end
-	
-	if not buffL1Found then
-		mainFrame.buffWatchL1:Hide()
-	end
-	
-	if not buffR1Found then
-		mainFrame.buffWatchR1:Hide()
+		UpdateSpellbookCache()
+		UpdateHealth()
+		UpdatePower()
+		
+	elseif event == "SPELLS_CHANGED" then
+		UpdateSpellbookCache()
+        
+    -- Instantly catches live seal swaps and buff casts in combat!
+    elseif event == "UNIT_SPELLCAST_SUCCEEDED" and arg1 == "player" then
+        local _, castGUID, spellID = ...
+        OnSpellCastSucceeded(spellID or castGUID)
+        
+	elseif (event == "UNIT_HEALTH" or event == "UNIT_MAXHEALTH") and arg1 == "player" then
+		UpdateHealth()
+	elseif (event == "UNIT_POWER_UPDATE" or event == "UNIT_MAXPOWER") and arg1 == "player" then
+		UpdatePower()
+	elseif event == "PLAYER_REGEN_DISABLED" then
+		playerIsInCombatLockdown = true
+		ChangeHealthBarVisibility()
+	elseif event == "PLAYER_REGEN_ENABLED" then
+		playerIsInCombatLockdown = false
+		ChangeHealthBarVisibility()
 	end
 end)
 
---frame:SetScript("OnEvent", dispatchEvents)
 mainFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 mainFrame:RegisterEvent("ADDON_LOADED")
+mainFrame:RegisterEvent("SPELLS_CHANGED")
+mainFrame:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
 
 local barAlpha = 1
-local barBackgroundAlpha = 0.5
-
 local statusBarTexture = "Interface\\AddOns\\CoolHealthBar\\img\\statusbar\\XPerl_StatusBar7"
 
 function UpdateHealth()
 	currentHp = UnitHealth("player")
 	maxHp = UnitHealthMax("player")
 	
-	-- Pass the secret values directly back into the StatusBar C-API
-	-- This works perfectly because the UI engine is allowed to read secret values.
 	mainFrame.health:SetMinMaxValues(0, maxHp)
 	mainFrame.health:SetValue(currentHp)
 	
-	-- Check if Blizzard has locked down the values
+	-- 1. NON-SECRET VALUES
 	if not issecretvalue(currentHp) and not issecretvalue(maxHp) then
-		-- SAFE: Not secret, we can do normal math!
 		if maxHp <= 0 then maxHp = 1 end
 		local healthPercent = math.floor((currentHp / maxHp) * 100)
 		
@@ -287,15 +419,21 @@ function UpdateHealth()
 			mainFrame.health:SetStatusBarColor(0, 1, 0, barAlpha)
 		end
 		
-		-- Use SetFormattedText instead of string concatenation (..)
 		mainFrame.health.text:SetFormattedText("%d / %d (%d%%)", currentHp, maxHp, healthPercent)
+	-- 2. SECRET VALUES (Combat)
 	else
-		-- RESTRICTED: Values are secret (usually in-combat). 
-		-- We cannot calculate percentages or dynamically change the color in Lua.
-		mainFrame.health:SetStatusBarColor(0, 1, 0, barAlpha) -- Fallback to green
+		mainFrame.health:SetStatusBarColor(0, 1, 0, barAlpha)
 		
-		-- Pass the secret values directly to the C-side formatter to bypass Lua concatenation
-		mainFrame.health.text:SetFormattedText("%s / %s", currentHp, maxHp)
+		local curStr = AbbreviateNumbers and AbbreviateNumbers(currentHp) or currentHp
+		local maxStr = AbbreviateNumbers and AbbreviateNumbers(maxHp) or maxHp
+		
+		if UnitHealthPercent then
+			local curve = CurveConstants and CurveConstants.ScaleTo100 or ScaleTo100Curve
+			local pct = curve and UnitHealthPercent("player", true, curve) or UnitHealthPercent("player")
+			mainFrame.health.text:SetFormattedText("%s / %s (%.0f%%)", curStr, maxStr, pct)
+		else
+			mainFrame.health.text:SetFormattedText("%s / %s", curStr, maxStr)
+		end
 	end
 	
 	ChangeHealthBarVisibility()
@@ -305,31 +443,26 @@ function UpdatePower()
 	currentPower = UnitPower("player")
 	maxPower = UnitPowerMax("player")
 	
-	-- Pass the secret values directly into the C-API
 	mainFrame.power:SetMinMaxValues(0, maxPower)
 	mainFrame.power:SetValue(currentPower)
 	
 	local powerType = UnitPowerType("player")
-	
 	if powerType == 0 then
 		mainFrame.power:SetStatusBarColor(0, 0, 1, barAlpha)
 	elseif powerType == 1 then
 		mainFrame.power:SetStatusBarColor(1, 0, 0, barAlpha)
-	elseif powerType == 2 or powerType == 3 then
-		mainFrame.power:SetStatusBarColor(1, 1, 0, barAlpha)
 	else
 		mainFrame.power:SetStatusBarColor(1, 1, 0, barAlpha)
 	end
 	
 	if not issecretvalue(currentPower) and not issecretvalue(maxPower) then
-		-- SAFE: Not secret, we can do normal math!
 		if maxPower <= 0 then maxPower = 1 end
 		local powerPercent = math.floor((currentPower / maxPower) * 100)
-		
 		mainFrame.power.text:SetFormattedText("%d / %d (%d%%)", currentPower, maxPower, powerPercent)
 	else
-		-- RESTRICTED: We cannot do percentage math here safely.
-		mainFrame.power.text:SetFormattedText("%s / %s", currentPower, maxPower)
+		local curPStr = AbbreviateNumbers and AbbreviateNumbers(currentPower) or currentPower
+		local maxPStr = AbbreviateNumbers and AbbreviateNumbers(maxPower) or maxPower
+		mainFrame.power.text:SetFormattedText("%s / %s", curPStr, maxPStr)
 	end
 	
 	ChangeHealthBarVisibility()
@@ -338,20 +471,16 @@ end
 function ChangeHealthBarVisibility()
 	local shouldShow = true
 	
-	-- Helper function to safely check if HP is not full without triggering taint
 	local function IsHpNotFull()
 		if issecretvalue(currentHp) or issecretvalue(maxHp) then return false end
 		return currentHp < maxHp
 	end
 	
-	-- Helper function to safely check if Power is not full without triggering taint
 	local function IsPowerNotFull(pType)
 		if issecretvalue(currentPower) or issecretvalue(maxPower) then return false end
 		if pType == 1 then 
-			-- Rage starts at 0 and goes up
 			return currentPower > 0
 		else
-			-- Mana/Energy starts at max and goes down
 			return currentPower < maxPower
 		end
 	end
@@ -375,7 +504,6 @@ function ChangeHealthBarVisibility()
 		end
 	end
 	
-	-- Always hide if dead or ghost
 	if UnitIsDeadOrGhost("player") then
 		shouldShow = false
 	end
@@ -390,12 +518,7 @@ end
 function CoolHealthBar_OnLoad()
 	initSettings()
 	
-	coolHealthBarScanTooltip = CreateFrame( "GameTooltip", "CoolHealthBarScanTooltip", nil, "GameTooltipTemplate" )
-	coolHealthBarScanTooltip:SetOwner( WorldFrame, "ANCHOR_NONE" )
-	
 	print(string.format("%s by Redbu11 is loaded successfully\nThank you for using my addon", "CoolHealthBar"))
-	
-	-- (The old mainFrame:SetScript block was deleted from here)
 
 	mainFrame:RegisterEvent("UNIT_HEALTH")
 	mainFrame:RegisterEvent("UNIT_MAXHEALTH")
@@ -403,7 +526,6 @@ function CoolHealthBar_OnLoad()
 	mainFrame:RegisterEvent("UNIT_MAXPOWER")
 	mainFrame:RegisterEvent("PLAYER_REGEN_DISABLED")
 	mainFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
-	mainFrame:RegisterEvent("UNIT_AURA")
 	
 	mainFrame:SetWidth(math.max(1, CoolHealthBarSettings.barsWidth+8))
 	mainFrame:SetHeight(math.max(1, CoolHealthBarSettings.healthBarHeight+CoolHealthBarSettings.powerBarHeight+8))
@@ -418,7 +540,7 @@ function CoolHealthBar_OnLoad()
 	mainFrame:SetBackdropColor(0,0,0,.5)
 	
 	mainFrame.health = CreateFrame("StatusBar", nil, mainFrame, "BackdropTemplate")
-	mainFrame.health:SetFrameLevel(1) -- keep above glow
+	mainFrame.health:SetFrameLevel(1)
 	mainFrame.health:SetOrientation("HORIZONTAL")
 	mainFrame.health:SetStatusBarTexture(statusBarTexture)
 	mainFrame.health:SetStatusBarColor(0, 1, 0, barAlpha)
@@ -428,17 +550,11 @@ function CoolHealthBar_OnLoad()
 	mainFrame.health:SetMinMaxValues(0, UnitHealthMax("player"))
 	mainFrame.health:SetValue(UnitHealth("player"))
 	mainFrame.health.text = mainFrame.health:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-	--nameplate.health.text:SetAllPoints()
 	mainFrame.health.text:SetPoint("RIGHT", mainFrame.health, "RIGHT", -2, -8)
 	mainFrame.health.text:SetTextColor(1,1,1,barAlpha)
 	mainFrame.health.text:SetFont("Interface\\AddOns\\CoolHealthBar\\fonts\\francois.ttf", 12, "OUTLINE")
 	mainFrame.health.text:SetJustifyH("RIGHT")
 	mainFrame.health.text:SetText("health")
-	
-	-- mainFrame.health.bg = mainFrame.health:CreateTexture(nil, "BACKGROUND")
-	-- mainFrame.health.bg:SetTexture("Interface\\AddOns\\CoolHealthBar\\img\\statusbar\\XPerl_StatusBar4")
-	-- mainFrame.health.bg:SetAllPoints()
-	-- mainFrame.health.bg:SetVertexColor(0, 0, 0, barBackgroundAlpha)
 	
 	mainFrame.health:SetBackdrop({
 		bgFile = "Interface/Tooltips/UI-Tooltip-Background",
@@ -447,12 +563,10 @@ function CoolHealthBar_OnLoad()
 		insets = { left = 0, right = 0, top = 0, bottom = 0 },
 	})
 	mainFrame.health:SetBackdropColor(0,0,0,.5)
-	
 	mainFrame.health:Show()
 	
-	
 	mainFrame.power = CreateFrame("StatusBar", nil, mainFrame, "BackdropTemplate")
-	mainFrame.power:SetFrameLevel(1) -- keep above glow
+	mainFrame.power:SetFrameLevel(1)
 	mainFrame.power:SetOrientation("HORIZONTAL")
 	mainFrame.power:SetStatusBarTexture(statusBarTexture)
 	mainFrame.power:SetStatusBarColor(0, 0, 1, barAlpha)
@@ -468,11 +582,6 @@ function CoolHealthBar_OnLoad()
 	mainFrame.power.text:SetJustifyH("RIGHT")
 	mainFrame.power.text:SetText("power")
 	
-	-- mainFrame.power.bg = mainFrame.power:CreateTexture(nil, "BACKGROUND")
-	-- mainFrame.power.bg:SetTexture("Interface\\AddOns\\CoolHealthBar\\img\\statusbar\\XPerl_StatusBar4")
-	-- mainFrame.power.bg:SetAllPoints()
-	-- mainFrame.power.bg:SetVertexColor(0, 0, 0, barBackgroundAlpha)
-	
 	mainFrame.power:SetBackdrop({
 		bgFile = "Interface/Tooltips/UI-Tooltip-Background",
 		edgeFile = "Interface/Tooltips/UI-Tooltip-Border",
@@ -480,7 +589,6 @@ function CoolHealthBar_OnLoad()
 		insets = { left = 0, right = 0, top = 0, bottom = 0 },
 	})
 	mainFrame.power:SetBackdropColor(0,0,0,.5)
-	
 	mainFrame.power:Show()
 	
 	local borderImageSize = 80
@@ -493,7 +601,6 @@ function CoolHealthBar_OnLoad()
 	mainFrame.borderImageL.icon = mainFrame.borderImageL:CreateTexture(nil, "BORDER")
 	mainFrame.borderImageL.icon:SetTexCoord(1, 0, 0, 1)
 	mainFrame.borderImageL.icon:SetVertexColor(0.7, 0.7, 0.7, 1)
-	--mainFrame.borderImageL.icon:SetVertexColor(1, 1, 0, 1)
 	mainFrame.borderImageL.icon:SetAllPoints()
 	mainFrame.borderImageL.icon:SetTexture("Interface\\AddOns\\CoolHealthBar\\img\\sword_256")
 	mainFrame.borderImageL:Show()
@@ -505,53 +612,62 @@ function CoolHealthBar_OnLoad()
 	mainFrame.borderImageR:SetWidth(borderImageSize)
 	mainFrame.borderImageR.icon = mainFrame.borderImageR:CreateTexture(nil, "BORDER")
 	mainFrame.borderImageR.icon:SetVertexColor(0.7, 0.7, 0.7, 1)
-	--mainFrame.borderImageR.icon:SetTexCoord(1, 0, 0, 1)
-	--mainFrame.borderImageR.icon:SetVertexColor(1, 1, 0, 1)
 	mainFrame.borderImageR.icon:SetAllPoints()
 	mainFrame.borderImageR.icon:SetTexture("Interface\\AddOns\\CoolHealthBar\\img\\sword_256")
 	mainFrame.borderImageR:Show()
 	
-	
+	-- BuffWatch L1
 	mainFrame.buffWatchL1 = CreateFrame("Frame", nil, mainFrame)
 	mainFrame.buffWatchL1:SetPoint("BOTTOMLEFT", mainFrame.health, "TOPLEFT", 0, 2)
 	mainFrame.buffWatchL1:SetHeight(math.max(1, CoolHealthBarSettings.buffWatchSize))
 	mainFrame.buffWatchL1:SetWidth(math.max(1, CoolHealthBarSettings.buffWatchSize))
-	mainFrame.buffWatchL1.icon = mainFrame.buffWatchL1:CreateTexture(nil, "ARTWORK")
+	mainFrame.buffWatchL1.icon = mainFrame.buffWatchL1:CreateTexture(nil, "BACKGROUND")
 	mainFrame.buffWatchL1.icon:SetTexture("Interface\\Icons\\Spell_Holy_AuraOfLight")
 	mainFrame.buffWatchL1.icon:SetAllPoints()
+	
+	mainFrame.buffWatchL1.cooldown = CreateFrame("Cooldown", nil, mainFrame.buffWatchL1, "CooldownFrameTemplate")
+	mainFrame.buffWatchL1.cooldown:SetAllPoints()
+	mainFrame.buffWatchL1.cooldown:SetReverse(true)
+	mainFrame.buffWatchL1.cooldown:SetHideCountdownNumbers(true)
+	
 	mainFrame.buffWatchL1.textDuration = mainFrame.buffWatchL1:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	mainFrame.buffWatchL1.textDuration:SetPoint("CENTER", mainFrame.buffWatchL1, "CENTER", 0, 0)
 	mainFrame.buffWatchL1.textDuration:SetTextColor(1,1,1,barAlpha)
 	mainFrame.buffWatchL1.textDuration:SetFont("Fonts\\FRIZQT__.TTF", math.max(1, CoolHealthBarSettings.buffWatchSize/2), "OUTLINE")
-	mainFrame.buffWatchL1.textDuration:SetJustifyH("RIGHT")
-	mainFrame.buffWatchL1.textDuration:SetText("99")
+	mainFrame.buffWatchL1.textDuration:SetJustifyH("CENTER")
+	
 	mainFrame.buffWatchL1.textCount = mainFrame.buffWatchL1:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	mainFrame.buffWatchL1.textCount:SetPoint("BOTTOMRIGHT", mainFrame.buffWatchL1, "BOTTOMRIGHT", -math.max(0.1, CoolHealthBarSettings.buffWatchSize/20), math.max(0.1, CoolHealthBarSettings.buffWatchSize/10))
 	mainFrame.buffWatchL1.textCount:SetTextColor(1,1,1,barAlpha)
 	mainFrame.buffWatchL1.textCount:SetFont("Fonts\\FRIZQT__.TTF", math.max(1, CoolHealthBarSettings.buffWatchSize/4), "OUTLINE")
 	mainFrame.buffWatchL1.textCount:SetJustifyH("RIGHT")
-	mainFrame.buffWatchL1.textCount:SetText("99")
 	mainFrame.buffWatchL1:Show()
 	
+	-- BuffWatch R1
 	mainFrame.buffWatchR1 = CreateFrame("Frame", nil, mainFrame)
 	mainFrame.buffWatchR1:SetPoint("BOTTOMRIGHT", mainFrame.health, "TOPRIGHT", 0, 2)
 	mainFrame.buffWatchR1:SetHeight(math.max(1, CoolHealthBarSettings.buffWatchSize))
 	mainFrame.buffWatchR1:SetWidth(math.max(1, CoolHealthBarSettings.buffWatchSize))
-	mainFrame.buffWatchR1.icon = mainFrame.buffWatchR1:CreateTexture(nil, "ARTWORK")
+	mainFrame.buffWatchR1.icon = mainFrame.buffWatchR1:CreateTexture(nil, "BACKGROUND")
 	mainFrame.buffWatchR1.icon:SetTexture("Interface\\Icons\\Spell_Holy_AuraOfLight")
 	mainFrame.buffWatchR1.icon:SetAllPoints()
+	
+	mainFrame.buffWatchR1.cooldown = CreateFrame("Cooldown", nil, mainFrame.buffWatchR1, "CooldownFrameTemplate")
+	mainFrame.buffWatchR1.cooldown:SetAllPoints()
+	mainFrame.buffWatchR1.cooldown:SetReverse(true)
+	mainFrame.buffWatchR1.cooldown:SetHideCountdownNumbers(true)
+	
 	mainFrame.buffWatchR1.textDuration = mainFrame.buffWatchR1:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	mainFrame.buffWatchR1.textDuration:SetPoint("CENTER", mainFrame.buffWatchR1, "CENTER", 0, 0)
 	mainFrame.buffWatchR1.textDuration:SetTextColor(1,1,1,barAlpha)
 	mainFrame.buffWatchR1.textDuration:SetFont("Fonts\\FRIZQT__.TTF", math.max(1, CoolHealthBarSettings.buffWatchSize/2), "OUTLINE")
-	mainFrame.buffWatchR1.textDuration:SetJustifyH("RIGHT")
-	mainFrame.buffWatchR1.textDuration:SetText("99")
+	mainFrame.buffWatchR1.textDuration:SetJustifyH("CENTER")
+	
 	mainFrame.buffWatchR1.textCount = mainFrame.buffWatchR1:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	mainFrame.buffWatchR1.textCount:SetPoint("BOTTOMRIGHT", mainFrame.buffWatchR1, "BOTTOMRIGHT", -math.max(0.1, CoolHealthBarSettings.buffWatchSize/20), math.max(0.1, CoolHealthBarSettings.buffWatchSize/10))
 	mainFrame.buffWatchR1.textCount:SetTextColor(1,1,1,barAlpha)
 	mainFrame.buffWatchR1.textCount:SetFont("Fonts\\FRIZQT__.TTF", math.max(1, CoolHealthBarSettings.buffWatchSize/4), "OUTLINE")
 	mainFrame.buffWatchR1.textCount:SetJustifyH("RIGHT")
-	mainFrame.buffWatchR1.textCount:SetText("99")
 	mainFrame.buffWatchR1:Show()
 	
 	applyAllSettings()
@@ -703,8 +819,6 @@ function initSettings()
 	})
 	coolHealthBarOptionsFrame:SetBackdropColor(0,0,0,.5)
 	
-	---------------------
-	
 	coolHealthBarOptionsFrame.title = coolHealthBarOptionsFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	coolHealthBarOptionsFrame.title:SetPoint("TOP", coolHealthBarOptionsFrame, "TOP", 0, -8)
 	coolHealthBarOptionsFrame.title:SetTextColor(1,1,1,barAlpha)
@@ -806,8 +920,6 @@ function initSettings()
 		end
 	end)
 	
-	--------
-	
 	local offsetXInputTitle = scrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	offsetXInputTitle:SetPoint("TOPLEFT", offsetYInputTitle, "BOTTOMLEFT", 0, -16)
 	offsetXInputTitle:SetTextColor(0.999,0.819,0,barAlpha)
@@ -841,9 +953,6 @@ function initSettings()
 			applyAllSettings()
 		end
 	end)
-	
-	
-	---------------
 	
 	local barWidthInputTitle = scrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	barWidthInputTitle:SetPoint("TOPLEFT", offsetXInputTitle, "BOTTOMLEFT", 0, -16)
@@ -879,8 +988,6 @@ function initSettings()
 		end
 	end)
 	
-	--------
-	
 	local hpBarHeightInputTitle = scrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	hpBarHeightInputTitle:SetPoint("TOPLEFT", barWidthInputTitle, "BOTTOMLEFT", 0, -16)
 	hpBarHeightInputTitle:SetTextColor(0.999,0.819,0,barAlpha)
@@ -914,8 +1021,6 @@ function initSettings()
 			applyAllSettings()
 		end
 	end)
-	
-	--------
 	
 	local powerBarHeightInputTitle = scrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	powerBarHeightInputTitle:SetPoint("TOPLEFT", hpBarHeightInputTitle, "BOTTOMLEFT", 0, -16)
@@ -951,16 +1056,11 @@ function initSettings()
 		end
 	end)
 	
-	
-	-----------------
-	
 	local buffWatchSectionTitle = scrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	buffWatchSectionTitle:SetPoint("TOPLEFT", powerBarHeightInputTitle, "BOTTOMLEFT", 0, -16)
 	buffWatchSectionTitle:SetTextColor(1,1,1,barAlpha)
 	buffWatchSectionTitle:SetJustifyH("LEFT")
 	buffWatchSectionTitle:SetText("Buff watch")
-	
-	-------------
 	
 	local buffWatchSizeInputTitle = scrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	buffWatchSizeInputTitle:SetPoint("TOPLEFT", buffWatchSectionTitle, "BOTTOMLEFT", 0, -16)
@@ -995,8 +1095,6 @@ function initSettings()
 			applyAllSettings()
 		end
 	end)
-	
-	-------------
 	
 	local buffWatchSectionDescription = scrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormal")
 	buffWatchSectionDescription:SetPoint("TOPLEFT", buffWatchSizeInputTitle, "BOTTOMLEFT", 0, -16)
@@ -1107,83 +1205,86 @@ function initSettings()
 	coolHealthBarOptionsFrame:Hide()
 end
 
-local CHBMinimapButton = CreateFrame('Button', "CHBMainMenuBarToggler", Minimap)
+-------------------------------------------------
+-- MINIMAP BUTTON
+-------------------------------------------------
+local CHBMinimapButton = CreateFrame("Button", "CHBMainMenuBarToggler", Minimap)
+CHBMinimapButton:SetSize(31, 31)
+CHBMinimapButton:SetFrameLevel(8)
+CHBMinimapButton:SetHighlightTexture('Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight')
+CHBMinimapButton:SetMovable(true)
+CHBMinimapButton:EnableMouse(true)
 
-function LoadCHBMinimapButton()
-    CHBMinimapButton:SetFrameStrata('MEDIUM')
-    CHBMinimapButton:SetWidth(31)
-    CHBMinimapButton:SetHeight(31)
-    CHBMinimapButton:SetFrameLevel(8)
-    CHBMinimapButton:SetHighlightTexture('Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight')
-	CHBMinimapButton:SetMovable(true)
-	CHBMinimapButton:EnableMouse(true)
+local overlay = CHBMinimapButton:CreateTexture(nil, "OVERLAY")
+overlay:SetSize(53, 53)
+overlay:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+overlay:SetPoint("TOPLEFT")
 
-    local CHBMinimapButtonOverlay = CHBMinimapButton:CreateTexture(nil, 'OVERLAY')
-    CHBMinimapButtonOverlay:SetWidth(53)
-    CHBMinimapButtonOverlay:SetHeight(53)
-    CHBMinimapButtonOverlay:SetTexture('Interface\\Minimap\\MiniMap-TrackingBorder')
-    CHBMinimapButtonOverlay:SetPoint('TOPLEFT', 0, 0)
+local icon = CHBMinimapButton:CreateTexture(nil, "BACKGROUND")
+icon:SetSize(20, 20)
+icon:SetTexture("Interface\\Icons\\Spell_ChargeNegative")
+icon:SetTexCoord(0.05, 0.95, 0.05, 0.95)
+icon:SetPoint("TOPLEFT", 7, -5)
+CHBMinimapButton.icon = icon
 
-    local icon = CHBMinimapButton:CreateTexture(nil, 'BACKGROUND')
-    icon:SetWidth(20)
-    icon:SetHeight(20)
-    icon:SetTexture('Interface\\Icons\\Spell_ChargeNegative')
-    icon:SetTexCoord(0.05, 0.95, 0.05, 0.95)
-    icon:SetPoint('TOPLEFT', 7, -5)
-    CHBMinimapButton.icon = icon
-
-    CHBMinimapButton:SetScript("OnClick", function(self, button)
-		if button == "LeftButton" then
-			if not coolHealthBarOptionsFrame:IsShown() then
-				coolHealthBarOptionsFrame:Show()
-			else
-				coolHealthBarOptionsFrame:Hide()
-			end
-		elseif button == "RightButton" then
-			-- nothing
-		end
-	end)
-	
-	CHBMinimapButton:RegisterForDrag("RightButton")
-	CHBMinimapButton:SetScript("OnDragStart", function(self)
-		CHBMinimapButton:StartMoving()
-		CHBMinimapButton:SetScript("OnUpdate", function(self)
-			local Xpoa, Ypoa = GetCursorPosition()
-			local Xmin, Ymin = Minimap:GetLeft(), Minimap:GetBottom()
-			Xpoa = Xmin - Xpoa / Minimap:GetEffectiveScale() + 70
-			Ypoa = Ypoa / Minimap:GetEffectiveScale() - Ymin - 70
-			CoolHealthBarSettings.minimapIconPos = math.deg(math.atan2(Ypoa, Xpoa))
-			CHBMinimapButton:ClearAllPoints()
-			CHBMinimapButton:SetPoint("TOPLEFT", Minimap, "TOPLEFT", 52 - (80 * math.cos(math.rad(CoolHealthBarSettings.minimapIconPos))), (80 * math.sin(math.rad(CoolHealthBarSettings.minimapIconPos))) - 52)
-		end)
-	end)
-	 
-	CHBMinimapButton:SetScript("OnDragStop", function(self)
-		CHBMinimapButton:StopMovingOrSizing()
-		CHBMinimapButton:SetScript("OnUpdate", nil)
-	end)
-	
-	CHBMinimapButton:SetScript("OnEnter", function(self)			
-		GameTooltip_SetDefaultAnchor(GameTooltip, UIParent)
-		local scale = GameTooltip:GetEffectiveScale()
-		local x, y = GetCursorPosition()
-		GameTooltip:ClearAllPoints()
-		GameTooltip:SetPoint("BOTTOMRIGHT", UIParent, "BOTTOMLEFT", x / scale, y / scale)
-		GameTooltip:SetText("CoolHealthBar")
-		GameTooltip:AddLine("\n")
-		GameTooltip:AddLine("Left-click to show options", 1, 1, 1)
-		GameTooltip:AddLine("Right-click and drag to move the button", 1, 1, 1)
-		GameTooltip:Show()
-	end)
-	
-	CHBMinimapButton:SetScript("OnLeave", function(self)
-		GameTooltip:Hide()
-	end)
-
+-- Universal circular positioning around the true center of the Minimap
+local function UpdateMinimapButtonPosition(angle)
+    local rad = math.rad(angle or 0)
+    -- Places the button center directly along the circular border
+    local radius = (Minimap:GetWidth() / 2) + 5
+    local x = math.cos(rad) * radius
+    local y = math.sin(rad) * radius
     
-	if CoolHealthBarSettings.minimapIconPos ~= 0 then
-		CHBMinimapButton:SetPoint("TOPLEFT", Minimap, "TOPLEFT", 52 - (80 * math.cos(math.rad(CoolHealthBarSettings.minimapIconPos))), (80 * math.sin(math.rad(CoolHealthBarSettings.minimapIconPos))) - 52)
-	else
-		CHBMinimapButton:SetPoint("BOTTOMRIGHT", Minimap, "BOTTOMRIGHT", -2, 2)
-	end
+    CHBMinimapButton:ClearAllPoints()
+    CHBMinimapButton:SetPoint("CENTER", Minimap, "CENTER", x, y)
 end
+
+CHBMinimapButton:SetScript("OnClick", function(self, button)
+    if button == "LeftButton" then
+        coolHealthBarOptionsFrame:SetShown(not coolHealthBarOptionsFrame:IsShown())
+    end
+end)
+
+CHBMinimapButton:RegisterForDrag("RightButton")
+CHBMinimapButton:SetScript("OnDragStart", function(self)
+    self:StartMoving()
+    self:SetScript("OnUpdate", function()
+        local cursorX, cursorY = GetCursorPosition()
+        local scale = UIParent:GetEffectiveScale()
+        cursorX = cursorX / scale
+        cursorY = cursorY / scale
+
+        local miniX, miniY = Minimap:GetCenter()
+        if not miniX or not miniY then return end
+
+        -- Calculate true angle relative to the Minimap center
+        local angle = math.deg(math.atan2(cursorY - miniY, cursorX - miniX))
+        if angle < 0 then
+            angle = angle + 360
+        end
+
+        CoolHealthBarSettings.minimapIconPos = angle
+        UpdateMinimapButtonPosition(angle)
+    end)
+end)
+
+CHBMinimapButton:SetScript("OnDragStop", function(self)
+    self:StopMovingOrSizing()
+    self:SetScript("OnUpdate", nil)
+end)
+
+CHBMinimapButton:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+    GameTooltip:SetText("CoolHealthBar")
+    GameTooltip:AddLine("Left-click to show options\nRight-click and drag to move", 1, 1, 1)
+    GameTooltip:Show()
+end)
+
+CHBMinimapButton:SetScript("OnLeave", function(self)
+    GameTooltip:Hide()
+end)
+
+C_Timer.After(0.5, function()
+    local pos = (CoolHealthBarSettings and CoolHealthBarSettings.minimapIconPos) or 220
+    UpdateMinimapButtonPosition(pos)
+end)
