@@ -424,8 +424,8 @@ function UpdateHealth()
 	else
 		mainFrame.health:SetStatusBarColor(0, 1, 0, barAlpha)
 		
-		local curStr = AbbreviateNumbers and AbbreviateNumbers(currentHp) or currentHp
-		local maxStr = AbbreviateNumbers and AbbreviateNumbers(maxHp) or maxHp
+		local curStr = currentHp
+		local maxStr = maxHp
 		
 		if UnitHealthPercent then
 			local curve = CurveConstants and CurveConstants.ScaleTo100 or ScaleTo100Curve
@@ -455,14 +455,43 @@ function UpdatePower()
 		mainFrame.power:SetStatusBarColor(1, 1, 0, barAlpha)
 	end
 	
+	-- 1. NON-SECRET VALUES (Out of combat)
 	if not issecretvalue(currentPower) and not issecretvalue(maxPower) then
 		if maxPower <= 0 then maxPower = 1 end
 		local powerPercent = math.floor((currentPower / maxPower) * 100)
 		mainFrame.power.text:SetFormattedText("%d / %d (%d%%)", currentPower, maxPower, powerPercent)
+	-- 2. SECRET VALUES (Combat / In-dungeon)
 	else
-		local curPStr = AbbreviateNumbers and AbbreviateNumbers(currentPower) or currentPower
-		local maxPStr = AbbreviateNumbers and AbbreviateNumbers(maxPower) or maxPower
-		mainFrame.power.text:SetFormattedText("%s / %s", curPStr, maxPStr)
+		local curPStr = currentPower
+		local maxPStr = maxPower
+		
+		local showedPct = false
+		if UnitPowerPercent then
+			local curve = CurveConstants and CurveConstants.ScaleTo100 or ScaleTo100Curve
+			-- Signature: UnitPowerPercent(unit, powerType, unmodified, curve)
+			local ok, pct = pcall(function()
+				return UnitPowerPercent("player", powerType, false, curve)
+			end)
+			if not ok or not pct then
+				ok, pct = pcall(function()
+					return UnitPowerPercent("player", nil, false, curve)
+				end)
+			end
+			if not ok or not pct then
+				ok, pct = pcall(function()
+					return UnitPowerPercent("player")
+				end)
+			end
+			
+			if ok and pct then
+				mainFrame.power.text:SetFormattedText("%s / %s (%.0f%%)", curPStr, maxPStr, pct)
+				showedPct = true
+			end
+		end
+
+		if not showedPct then
+			mainFrame.power.text:SetFormattedText("%s / %s", curPStr, maxPStr)
+		end
 	end
 	
 	ChangeHealthBarVisibility()
