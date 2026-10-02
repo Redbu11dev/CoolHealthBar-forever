@@ -1,4 +1,4 @@
-## Interface: 17000
+## Interface: 16001
 ## Title: CoolHealthBar
 ## Notes: Cool Health Bar by Redbu11
 ## LoadOnDemand: 0
